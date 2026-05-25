@@ -28,6 +28,7 @@
 
 import { NextResponse } from "next/server";
 import Groq from "groq-sdk";
+import { File } from "buffer";
 import { admin, adminDb } from "../../../lib/firebaseAdmin";
 
 // ----------------------------------------------------------------------------
@@ -280,29 +281,19 @@ async function transcribeTelegramVoice(fileId) {
     const buffer = Buffer.from(arrayBuffer);
 
     // Step 3: ship it to Whisper via Groq SDK.
-    // The Groq SDK in Node.js handles Buffers when they have a `name` property
-    // pinned to them, or we can use the `Blob` if available in newer Node.
-    // A robust way for Node is to pass the buffer as a stream or with the name.
+    // We use a explicit File object from 'buffer' to ensure compatibility
+    // in the Node.js runtime. This provides the 'name' and 'type' Groq needs.
     const transcription = await groq.audio.transcriptions.create({
-      file: await toFile(buffer, "voice.oga", { type: "audio/ogg" }),
+      file: new File([buffer], "voice.ogg", { type: "audio/ogg" }),
       model: WHISPER_MODEL,
       response_format: "json",
     });
 
     return (transcription?.text ?? "").trim();
   } catch (err) {
-    console.error("[transcribeTelegramVoice] Error:", err.message);
+    console.error("[transcribeTelegramVoice] Error:", err.message || err);
     throw err;
   }
-}
-
-/**
- * Helper to convert Buffer to a File-like object that the Groq SDK expects.
- */
-async function toFile(buffer, filename, options) {
-  // In newer groq-sdk versions, we might need a specific shape or use a Blob.
-  // Using a Blob is generally safe in Next.js/Vercel (Node 18+).
-  return new Blob([buffer], { type: options.type });
 }
 
 /**
