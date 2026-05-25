@@ -58,20 +58,22 @@ const LLAMA_MODEL = "llama-3.3-70b-versatile";
 
 // The accounting system prompt is the heart of our extraction quality.
 // It locks the model into a single role and a strict, well-defined schema.
-const BOOKKEEPING_SYSTEM_PROMPT = `You are KudiGuide, a precise bookkeeping engine for small business owners in Nigeria and across Africa. Your sole job is to read a single user message describing a business event and return a structured JSON ledger entry.
+const BOOKKEEPING_SYSTEM_PROMPT = `You are KudiGuide, a precise bookkeeping engine for small business owners in Nigeria and across Africa. Your job is to read a user message and determine their intent: either logging a business transaction OR requesting a financial report.
 
-Rules:
-- ALWAYS respond with a single valid JSON object — no prose, no markdown.
-- Currency mentions (naira, ₦, NGN, "k" for thousands, "m" for millions) should be normalized into a plain number (e.g. "5k" => 5000, "2.5m" => 2500000).
-- "income" means money coming IN to the business (sales, deposits, repayments received).
-- "expense" means money going OUT of the business (purchases, wages paid, bills).
-- If the message is conversational, a greeting, or contains no financial transaction, set "transaction_detected" to false, "type" to "none", and amount to null.
-- A "debtor" is anyone who owes the business money (e.g. "Tunde took 3 bags on credit", "Customer will pay next Friday"). When present, fill debtor_details with whatever was mentioned; use null for any field that was not specified.
-- Dates inside debtor_details.due_date should be returned exactly as the user phrased them (e.g. "next Friday", "end of month", "2026-06-01"). Do not invent dates.
-- The "description" field must be a single clear sentence summarizing the event in plain English.
+INTENT 1: LOGGING ("logging")
+- User describes a business event (sale, expense, debt).
+- Normalise currency (e.g. 5k -> 5000).
+- "income": money in, "expense": money out.
+- "debtor": anyone who owes money.
 
-You MUST output exactly this JSON shape (no extra keys):
+INTENT 2: REPORTING ("reporting")
+- User asks for profit, loss, summary, or details for a timeframe.
+- Timeframes: "today", "yesterday", "this week", "this month", "all time".
+- Default to "today" if unspecified.
+
+Output EXACTLY this JSON shape:
 {
+  "intent": "logging" | "reporting",
   "transaction_detected": true | false,
   "type": "income" | "expense" | "none",
   "amount": number | null,
@@ -81,6 +83,10 @@ You MUST output exactly this JSON shape (no extra keys):
     "name": string | null,
     "amount_owed": number | null,
     "due_date": string | null
+  },
+  "report_params": {
+    "timeframe": "today" | "yesterday" | "week" | "month" | "all",
+    "specific_date": string | null
   }
 }`;
 
@@ -163,12 +169,12 @@ export async function POST(request) {
     }
 
     // ---- 3. Run the bookkeeping extraction via Groq Llama-3 ----------------
-    let parsedLedgerData;
+    let parsedData;
     try {
       if (!process.env.GROQ_API_KEY) {
         throw new Error("GROQ_API_KEY is missing in environment variables.");
       }
-      parsedLedgerData = await extractLedgerEntry(transcript);
+      parsedData = await extractLedgerEntry(transcript);
     } catch (llmErr) {
       console.error("[telegram] LLM extraction failed:", llmErr.message || llmErr);
       if (llmErr.stack) console.error(llmErr.stack);
@@ -180,18 +186,31 @@ export async function POST(request) {
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    // ---- 4. Persist the entry to Firestore ---------------------------------
+    // ---- 4. Dispatch based on Intent (Logging vs Reporting) ----------------
+    if (parsedData.intent === "reporting") {
+      try {
+        const report = await generateFinancialReport(chatId, parsedData.report_params);
+        await safeSendTelegramMessage(chatId, report);
+      } catch (reportErr) {
+        console.error("[telegram] Report generation failed:", reportErr);
+        await safeSendTelegramMessage(
+          chatId,
+          "⚠️ I couldn't pull your report right now. Please try again in a moment."
+        );
+      }
+      return NextResponse.json({ ok: true }, { status: 200 });
+    }
+
+    // ---- 5. Persist the entry to Firestore (Logging Flow) -----------------
     try {
       await adminDb.collection("transactions").add({
         chatId,
         rawTranscript: transcript,
-        inputSource, // bonus context: "text" or "voice"
-        parsedLedgerData,
+        inputSource,
+        parsedLedgerData: parsedData,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     } catch (dbErr) {
-      // We still want to acknowledge to the user even if the DB write failed,
-      // so they know their message was received.
       console.error("[telegram] Firestore write failed:", dbErr);
       await safeSendTelegramMessage(
         chatId,
@@ -200,11 +219,10 @@ export async function POST(request) {
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    // ---- 5. Compose and send the human-readable receipt --------------------
-    const receipt = formatReceipt(parsedLedgerData, transcript);
+    // ---- 6. Compose and send the human-readable receipt --------------------
+    const receipt = formatReceipt(parsedData, transcript);
     await safeSendTelegramMessage(chatId, receipt);
 
-    // Final ACK to Telegram.
     return NextResponse.json({ ok: true }, { status: 200 });
   } catch (fatalErr) {
     // Catch-all so we NEVER bubble a 500 back to Telegram (which would trigger
@@ -237,45 +255,54 @@ async function transcribeTelegramVoice(fileId) {
     throw new Error("Missing TELEGRAM_BOT_TOKEN env var.");
   }
 
-  // Step 1: resolve file metadata -> file_path.
-  const metaUrl = `${TELEGRAM_API_BASE}/bot${token}/getFile?file_id=${encodeURIComponent(
-    fileId
-  )}`;
-  const metaResp = await fetch(metaUrl);
-  if (!metaResp.ok) {
-    throw new Error(
-      `Telegram getFile failed: ${metaResp.status} ${metaResp.statusText}`
-    );
+  try {
+    // Step 1: resolve file metadata -> file_path.
+    const metaUrl = `${TELEGRAM_API_BASE}/bot${token}/getFile?file_id=${encodeURIComponent(
+      fileId
+    )}`;
+    const metaResp = await fetch(metaUrl);
+    if (!metaResp.ok) {
+      throw new Error(`getFile failed: ${metaResp.status}`);
+    }
+    const metaJson = await metaResp.json();
+    const filePath = metaJson?.result?.file_path;
+    if (!filePath) {
+      throw new Error("Missing file_path in Telegram response.");
+    }
+
+    // Step 2: download the binary audio stream.
+    const fileUrl = `${TELEGRAM_API_BASE}/file/bot${token}/${filePath}`;
+    const fileResp = await fetch(fileUrl);
+    if (!fileResp.ok) {
+      throw new Error(`File download failed: ${fileResp.status}`);
+    }
+    const arrayBuffer = await fileResp.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // Step 3: ship it to Whisper via Groq SDK.
+    // The Groq SDK in Node.js handles Buffers when they have a `name` property
+    // pinned to them, or we can use the `Blob` if available in newer Node.
+    // A robust way for Node is to pass the buffer as a stream or with the name.
+    const transcription = await groq.audio.transcriptions.create({
+      file: await toFile(buffer, "voice.oga", { type: "audio/ogg" }),
+      model: WHISPER_MODEL,
+      response_format: "json",
+    });
+
+    return (transcription?.text ?? "").trim();
+  } catch (err) {
+    console.error("[transcribeTelegramVoice] Error:", err.message);
+    throw err;
   }
-  const metaJson = await metaResp.json();
-  const filePath = metaJson?.result?.file_path;
-  if (!filePath) {
-    throw new Error("Telegram getFile response missing result.file_path.");
-  }
+}
 
-  // Step 2: download the binary audio stream.
-  const fileUrl = `${TELEGRAM_API_BASE}/file/bot${token}/${filePath}`;
-  const fileResp = await fetch(fileUrl);
-  if (!fileResp.ok) {
-    throw new Error(
-      `Telegram file download failed: ${fileResp.status} ${fileResp.statusText}`
-    );
-  }
-  const audioBlob = await fileResp.blob();
-
-  // Step 3: wrap the binary as a virtual File so the Groq SDK treats it as
-  // a multipart upload. The filename's extension matters — ".oga" tells the
-  // server we're sending an Ogg/Opus container.
-  const audioFile = new File([audioBlob], "voice.oga", { type: "audio/ogg" });
-
-  // Step 4: ship it to Whisper.
-  const transcription = await groq.audio.transcriptions.create({
-    file: audioFile,
-    model: WHISPER_MODEL,
-    response_format: "json",
-  });
-
-  return (transcription?.text ?? "").trim();
+/**
+ * Helper to convert Buffer to a File-like object that the Groq SDK expects.
+ */
+async function toFile(buffer, filename, options) {
+  // In newer groq-sdk versions, we might need a specific shape or use a Blob.
+  // Using a Blob is generally safe in Next.js/Vercel (Node 18+).
+  return new Blob([buffer], { type: options.type });
 }
 
 /**
@@ -308,19 +335,12 @@ async function extractLedgerEntry(transcript) {
       rawContent
     );
     // Fall back to a safe "nothing detected" shape rather than crashing.
-    parsed = {
-      transaction_detected: false,
-      type: "none",
-      amount: null,
-      description: transcript,
-      has_debtor: false,
-      debtor_details: { name: null, amount_owed: null, due_date: null },
-    };
+    parsed = { intent: "logging", transaction_detected: false, type: "none" };
   }
 
-  // Normalize the shape so downstream code can rely on every key existing,
-  // even if the model omitted one.
+  // Normalize the shape
   return {
+    intent: parsed.intent === "reporting" ? "reporting" : "logging",
     transaction_detected: Boolean(parsed.transaction_detected),
     type: ["income", "expense", "none"].includes(parsed.type)
       ? parsed.type
@@ -342,7 +362,79 @@ async function extractLedgerEntry(transcript) {
           : null,
       due_date: parsed?.debtor_details?.due_date ?? null,
     },
+    report_params: {
+      timeframe: ["today", "yesterday", "week", "month", "all"].includes(
+        parsed?.report_params?.timeframe
+      )
+        ? parsed.report_params.timeframe
+        : "today",
+      specific_date: parsed?.report_params?.specific_date ?? null,
+    },
   };
+}
+
+/**
+ * Queries Firestore and generates a summary report for the user.
+ */
+async function generateFinancialReport(chatId, params) {
+  const { timeframe } = params;
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+
+  if (timeframe === "yesterday") {
+    start.setDate(start.getDate() - 1);
+    const end = new Date(start);
+    end.setHours(23, 59, 59, 999);
+  } else if (timeframe === "week") {
+    start.setDate(start.getDate() - 7);
+  } else if (timeframe === "month") {
+    start.setMonth(start.getMonth() - 1);
+  } else if (timeframe === "all") {
+    start.setFullYear(2000); // effectively all time
+  }
+
+  const snapshot = await adminDb
+    .collection("transactions")
+    .where("chatId", "==", chatId)
+    .where("createdAt", ">=", admin.firestore.Timestamp.fromDate(start))
+    .orderBy("createdAt", "desc")
+    .get();
+
+  if (snapshot.empty) {
+    return `📝 *Report for ${capitalize(timeframe)}:*\n\nNo transactions found in this period.`;
+  }
+
+  let totalIncome = 0;
+  let totalExpense = 0;
+  let totalDebt = 0;
+  const transactions = [];
+
+  snapshot.forEach((doc) => {
+    const data = doc.data();
+    const ledger = data.parsedLedgerData;
+    if (ledger.type === "income") totalIncome += ledger.amount || 0;
+    if (ledger.type === "expense") totalExpense += ledger.amount || 0;
+    if (ledger.has_debtor) totalDebt += ledger.debtor_details?.amount_owed || 0;
+    
+    transactions.push(ledger);
+  });
+
+  const profit = totalIncome - totalExpense;
+
+  const lines = [
+    `📊 *Financial Report: ${capitalize(timeframe)}*`,
+    "",
+    `🟢 *Total Income:* ₦${formatNumber(totalIncome)}`,
+    `🔴 *Total Expense:* ₦${formatNumber(totalExpense)}`,
+    "---",
+    `💰 *${profit >= 0 ? "Net Profit" : "Net Loss"}:* ₦${formatNumber(Math.abs(profit))}`,
+    "",
+    `📒 *Outstanding Credit:* ₦${formatNumber(totalDebt)}`,
+    "",
+    `_Generated based on ${snapshot.size} records._`
+  ];
+
+  return lines.join("\n");
 }
 
 /**
