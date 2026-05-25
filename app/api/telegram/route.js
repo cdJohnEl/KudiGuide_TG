@@ -28,7 +28,7 @@
 
 import { NextResponse } from "next/server";
 import Groq from "groq-sdk";
-import { admin, adminDb } from "@/lib/firebaseAdmin";
+import { admin, adminDb } from "../../../lib/firebaseAdmin";
 
 // ----------------------------------------------------------------------------
 // Runtime configuration
