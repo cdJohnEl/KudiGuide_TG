@@ -1,0 +1,26 @@
+{
+  "name": "kudiguide-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "KudiGuide AI - A voice-first financial ledger for small business owners via Telegram.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "groq-sdk": "^0.7.0",
+    "firebase-admin": "^12.3.0"
+  },
+  "devDependencies": {
+    "eslint": "8.57.0",
+    "eslint-config-next": "14.2.5"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  }
+}
