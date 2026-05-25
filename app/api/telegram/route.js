@@ -115,15 +115,17 @@ export async function POST(request) {
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    const chatId = message?.chat?.id;
+    const chatId = message?.chat?.id?.toString();
     if (!chatId) {
-      // Without a chat id we can't reply, so just acknowledge and exit.
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
+    // ---- 1a. User Lookup & Registration Check ------------------------------
+    const userRef = adminDb.collection("users").doc(chatId);
+    const userDoc = await userRef.get();
+    let userData = userDoc.exists ? userDoc.data() : null;
+
     // ---- 2. Resolve the user's textual input -------------------------------
-    // Either the user typed a message (`message.text`) or sent a voice note
-    // (`message.voice`). For voice notes we run the full Whisper pipeline.
     let transcript = null;
     let inputSource = "unknown";
 
@@ -131,12 +133,29 @@ export async function POST(request) {
       transcript = message.text.trim();
       inputSource = "text";
 
-      // ---- 2a. Handle specific commands like /start -------------------------
+      // Handle /start command explicitly
       if (transcript.toLowerCase().startsWith("/start")) {
-        await safeSendTelegramMessage(
-          chatId,
-          "👋 *Welcome to KudiGuide AI!* 📚\n\nI'm your voice-first financial ledger. Just send me a *voice note* or a *text* describing a business transaction, and I'll log it for you.\n\n*Examples:*\n• \"Sold 3 bags for 5000\"\n• \"Bought fuel 2500\"\n• \"Tunde took 2 crates on credit, will pay Friday\"\n\nHow can I help you today?"
-        );
+        if (!userData) {
+          // New user registration start
+          await userRef.set({
+            chatId,
+            status: "AWAITING_BUSINESS_NAME",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          await safeSendTelegramMessage(
+            chatId,
+            "👋 *Welcome to KudiGuide AI!* 📚\n\nI'm your voice-first financial ledger. To get started, what is the *name of your business*?"
+          );
+        } else if (userData.status !== "COMPLETED") {
+          // Resume onboarding
+          await handleOnboarding(chatId, userData, transcript, userRef);
+        } else {
+          // Returning user
+          await safeSendTelegramMessage(
+            chatId,
+            `👋 Welcome back to *${escapeMarkdown(userData.businessName)}*!\n\nHow can I help you today? (Voice or text to log/report)`
+          );
+        }
         return NextResponse.json({ ok: true }, { status: 200 });
       }
     } else if (message.voice && message.voice.file_id) {
@@ -151,12 +170,27 @@ export async function POST(request) {
         );
         return NextResponse.json({ ok: true }, { status: 200 });
       }
-    } else {
-      // Unsupported message type (sticker, photo without caption, etc.).
-      await safeSendTelegramMessage(
-        chatId,
-        "👋 Hi! Send me a *text* or a *voice note* describing a sale, expense, or credit, and I'll log it for you."
-      );
+    }
+
+    // ---- 2a. Onboarding State Machine ---------------------------------------
+    if (!userData || userData.status !== "COMPLETED") {
+      // If user doesn't exist but didn't use /start, or is in middle of onboarding
+      if (!userData) {
+        // Auto-initialize if they just messaged without /start
+        await userRef.set({
+          chatId,
+          status: "AWAITING_BUSINESS_NAME",
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        await safeSendTelegramMessage(
+          chatId,
+          "👋 *Hi! I'm KudiGuide AI.* 📚\n\nI'll help you track your business finances. First, what is the *name of your business*?"
+        );
+        return NextResponse.json({ ok: true }, { status: 200 });
+      }
+      
+      // Process onboarding step
+      await handleOnboarding(chatId, userData, transcript, userRef);
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
@@ -164,7 +198,7 @@ export async function POST(request) {
     if (!transcript || transcript.trim().length === 0) {
       await safeSendTelegramMessage(
         chatId,
-        "🤔 I didn't catch any words in that message. Mind trying again?"
+        "👋 Hi! Send me a *text* or a *voice note* describing a sale, expense, or credit, and I'll log it for you."
       );
       return NextResponse.json({ ok: true }, { status: 200 });
     }
@@ -206,6 +240,7 @@ export async function POST(request) {
     try {
       await adminDb.collection("transactions").add({
         chatId,
+        businessName: userData.businessName, // link to user profile
         rawTranscript: transcript,
         inputSource,
         parsedLedgerData: parsedData,
@@ -517,6 +552,33 @@ async function safeSendTelegramMessage(chatId, text) {
     }
   } catch (sendErr) {
     console.error("[telegram] sendMessage threw:", sendErr);
+  }
+}
+
+/**
+ * Handles the multi-step registration flow.
+ */
+async function handleOnboarding(chatId, userData, transcript, userRef) {
+  if (userData.status === "AWAITING_BUSINESS_NAME") {
+    const businessName = transcript;
+    await userRef.update({
+      businessName,
+      status: "AWAITING_CATEGORY",
+    });
+    await safeSendTelegramMessage(
+      chatId,
+      `Got it! *${escapeMarkdown(businessName)}* sounds like a great business. 🚀\n\nWhat *category* best describes your business? (e.g. Retail, Fashion, Food, Services)`
+    );
+  } else if (userData.status === "AWAITING_CATEGORY") {
+    const category = transcript;
+    await userRef.update({
+      category,
+      status: "COMPLETED",
+    });
+    await safeSendTelegramMessage(
+      chatId,
+      `Perfect! You're all set. ✅\n\n*Business:* ${userData.businessName}\n*Category:* ${category}\n\nYou can now log transactions (e.g. "Sold bread 500") or ask for reports ("Show my profit today").\n\nHow can I help you first?`
+    );
   }
 }
 
