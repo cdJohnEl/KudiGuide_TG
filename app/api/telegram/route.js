@@ -54,7 +54,7 @@ const groq = new Groq({
 // ----------------------------------------------------------------------------
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const WHISPER_MODEL = "whisper-large-v3";
-const LLAMA_MODEL = "llama3-70b-8192";
+const LLAMA_MODEL = "llama-3.3-70b-versatile";
 
 // The accounting system prompt is the heart of our extraction quality.
 // It locks the model into a single role and a strict, well-defined schema.
@@ -123,6 +123,15 @@ export async function POST(request) {
     if (typeof message.text === "string" && message.text.trim().length > 0) {
       transcript = message.text.trim();
       inputSource = "text";
+
+      // ---- 2a. Handle specific commands like /start -------------------------
+      if (transcript.toLowerCase().startsWith("/start")) {
+        await safeSendTelegramMessage(
+          chatId,
+          "👋 *Welcome to KudiGuide AI!* 📚\n\nI'm your voice-first financial ledger. Just send me a *voice note* or a *text* describing a business transaction, and I'll log it for you.\n\n*Examples:*\n• \"Sold 3 bags for 5000\"\n• \"Bought fuel 2500\"\n• \"Tunde took 2 crates on credit, will pay Friday\"\n\nHow can I help you today?"
+        );
+        return NextResponse.json({ ok: true }, { status: 200 });
+      }
     } else if (message.voice && message.voice.file_id) {
       inputSource = "voice";
       try {
@@ -156,9 +165,14 @@ export async function POST(request) {
     // ---- 3. Run the bookkeeping extraction via Groq Llama-3 ----------------
     let parsedLedgerData;
     try {
+      if (!process.env.GROQ_API_KEY) {
+        throw new Error("GROQ_API_KEY is missing in environment variables.");
+      }
       parsedLedgerData = await extractLedgerEntry(transcript);
     } catch (llmErr) {
-      console.error("[telegram] LLM extraction failed:", llmErr);
+      console.error("[telegram] LLM extraction failed:", llmErr.message || llmErr);
+      if (llmErr.stack) console.error(llmErr.stack);
+      
       await safeSendTelegramMessage(
         chatId,
         "⚠️ I had trouble understanding that. Could you rephrase it (e.g. *Sold 3 bags for 5000*)?"
