@@ -287,6 +287,7 @@ async function transcribeTelegramVoice(fileId) {
       file: new File([buffer], "voice.ogg", { type: "audio/ogg" }),
       model: WHISPER_MODEL,
       response_format: "json",
+      language: "en",
     });
 
     return (transcription?.text ?? "").trim();
