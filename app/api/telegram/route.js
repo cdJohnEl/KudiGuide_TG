@@ -59,22 +59,26 @@ const LLAMA_MODEL = "llama-3.3-70b-versatile";
 
 // The accounting system prompt is the heart of our extraction quality.
 // It locks the model into a single role and a strict, well-defined schema.
-const BOOKKEEPING_SYSTEM_PROMPT = `You are KudiGuide, a precise bookkeeping engine for small business owners in Nigeria and across Africa. Your job is to read a user message and determine their intent: either logging a business transaction OR requesting a financial report.
+const BOOKKEEPING_SYSTEM_PROMPT = `You are KudiGuide, a precise bookkeeping engine for small business owners in Nigeria and across Africa. Your job is to read a user message (which may be in English or Nigerian Pidgin) and determine their intent: logging a transaction, requesting a financial report, or asking for business advice.
 
 INTENT 1: LOGGING ("logging")
 - User describes a business event (sale, expense, debt).
-- Normalise currency (e.g. 5k -> 5000).
-- "income": money in, "expense": money out.
-- "debtor": anyone who owes money.
+- Normalise currency (e.g., 5k -> 5000, 2h -> 200).
+- "income": money in (sales, collections), "expense": money out (purchases, bills).
+- Pidgin examples: 
+  - "I sell 2 bags for 5k" -> {type: "income", amount: 5000, items: [{name: "bag", quantity: 2, action: "decrease"}]}
+  - "I buy fuel 2500" -> {type: "expense", amount: 2500}
+  - "Customer never pay for the fish" -> {has_debtor: true, debtor_details: {name: "Customer", amount_owed: null}}
 
 INTENT 2: REPORTING ("reporting")
-- User asks for profit, loss, summary, or details for a timeframe.
-- Timeframes: "today", "yesterday", "this week", "this month", "all time".
-- Default to "today" if unspecified.
+- User asks for profit, loss, summary. Timeframes: "today", "yesterday", "week", "month", "all".
+
+INTENT 3: ADVISORY ("advisory")
+- User asks for advice, health check, or "How am I doing?".
 
 Output EXACTLY this JSON shape:
 {
-  "intent": "logging" | "reporting",
+  "intent": "logging" | "reporting" | "advisory",
   "transaction_detected": true | false,
   "type": "income" | "expense" | "none",
   "amount": number | null,
@@ -85,6 +89,9 @@ Output EXACTLY this JSON shape:
     "amount_owed": number | null,
     "due_date": string | null
   },
+  "inventory_updates": [
+    { "item_name": "string", "quantity": number, "action": "increase" | "decrease" }
+  ],
   "report_params": {
     "timeframe": "today" | "yesterday" | "week" | "month" | "all",
     "specific_date": string | null
@@ -97,8 +104,6 @@ Output EXACTLY this JSON shape:
 export async function POST(request) {
   try {
     // ---- 1. Parse the incoming Telegram update payload ---------------------
-    // We defensively try/catch the JSON parse — a malformed body should not
-    // crash the route, just return 200 so Telegram stops retrying.
     let body;
     try {
       body = await request.json();
@@ -107,9 +112,29 @@ export async function POST(request) {
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    // Telegram updates can contain many top-level fields (edited_message,
-    // callback_query, channel_post, etc.). We only care about plain `message`
-    // events. Anything else: ack and bail.
+    // Handle Callback Queries (Buttons)
+    if (body.callback_query) {
+      const callback = body.callback_query;
+      const chatId = callback.message.chat.id.toString();
+      const data = callback.data;
+
+      if (data.startsWith("REMIND_")) {
+        await safeSendTelegramMessage(chatId, "✅ *Reminder Set!* I'll nudge you about this debt. (Note: Background scheduling logic pending Phase 3 completion)");
+      } else if (data === "GENERATE_RECEIPT") {
+        await safeSendTelegramMessage(chatId, "🧾 *Generating your digital receipt...* (Image generation pending Phase 5)");
+      }
+
+      // Always answer the callback query to stop the loading spinner
+      const token = process.env.TELEGRAM_BOT_TOKEN;
+      await fetch(`${TELEGRAM_API_BASE}/bot${token}/answerCallbackQuery`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ callback_query_id: callback.id }),
+      });
+
+      return NextResponse.json({ ok: true }, { status: 200 });
+    }
+
     const message = body?.message;
     if (!message) {
       return NextResponse.json({ ok: true }, { status: 200 });
@@ -170,6 +195,23 @@ export async function POST(request) {
         );
         return NextResponse.json({ ok: true }, { status: 200 });
       }
+    } else if (message.photo && message.photo.length > 0) {
+      inputSource = "photo";
+      const largestPhoto = message.photo[message.photo.length - 1];
+      try {
+        await safeSendTelegramMessage(chatId, "🔍 *Reading your receipt...* One moment please.");
+        const ocrResult = await extractFromImage(largestPhoto.file_id);
+        // Store in a local variable to avoid scope issues before the main extraction block
+        body.parsedData_ocr = ocrResult;
+        transcript = `OCR Scan: ${ocrResult.description}`;
+      } catch (ocrErr) {
+        console.error("[telegram] OCR extraction failed:", ocrErr);
+        await safeSendTelegramMessage(
+          chatId,
+          "⚠️ I couldn't read that receipt clearly. Please make sure the photo is bright and clear."
+        );
+        return NextResponse.json({ ok: true }, { status: 200 });
+      }
     }
 
     // ---- 2a. Onboarding State Machine ---------------------------------------
@@ -194,34 +236,40 @@ export async function POST(request) {
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
+    // ---- 2b. If not OCR, resolve the core ledger data via LLM ---------------
+    let parsedData = (inputSource === "photo") ? body.parsedData_ocr : null;
+
     // If after all that we still have no transcript, gracefully exit.
     if (!transcript || transcript.trim().length === 0) {
-      await safeSendTelegramMessage(
-        chatId,
-        "👋 Hi! Send me a *text* or a *voice note* describing a sale, expense, or credit, and I'll log it for you."
-      );
-      return NextResponse.json({ ok: true }, { status: 200 });
-    }
-
-    // ---- 3. Run the bookkeeping extraction via Groq Llama-3 ----------------
-    let parsedData;
-    try {
-      if (!process.env.GROQ_API_KEY) {
-        throw new Error("GROQ_API_KEY is missing in environment variables.");
+      if (inputSource !== "photo") {
+        await safeSendTelegramMessage(
+          chatId,
+          "👋 Hi! Send me a *text* or a *voice note* describing a sale, expense, or credit, and I'll log it for you."
+        );
+        return NextResponse.json({ ok: true }, { status: 200 });
       }
-      parsedData = await extractLedgerEntry(transcript);
-    } catch (llmErr) {
-      console.error("[telegram] LLM extraction failed:", llmErr.message || llmErr);
-      if (llmErr.stack) console.error(llmErr.stack);
-      
-      await safeSendTelegramMessage(
-        chatId,
-        "⚠️ I had trouble understanding that. Could you rephrase it (e.g. *Sold 3 bags for 5000*)?"
-      );
-      return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    // ---- 4. Dispatch based on Intent (Logging vs Reporting) ----------------
+    // ---- 3. Run the bookkeeping extraction via Groq Llama-3 (for Text/Voice) ---
+    if (!parsedData) {
+      try {
+        if (!process.env.GROQ_API_KEY) {
+          throw new Error("GROQ_API_KEY is missing in environment variables.");
+        }
+        parsedData = await extractLedgerEntry(transcript);
+      } catch (llmErr) {
+        console.error("[telegram] LLM extraction failed:", llmErr.message || llmErr);
+        if (llmErr.stack) console.error(llmErr.stack);
+        
+        await safeSendTelegramMessage(
+          chatId,
+          "⚠️ I had trouble understanding that. Could you rephrase it (e.g. *Sold 3 bags for 5000*)?"
+        );
+        return NextResponse.json({ ok: true }, { status: 200 });
+      }
+    }
+
+    // ---- 4. Dispatch based on Intent (Logging vs Reporting vs Advisory) ----
     if (parsedData.intent === "reporting") {
       try {
         const report = await generateFinancialReport(chatId, parsedData.report_params);
@@ -236,16 +284,36 @@ export async function POST(request) {
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    // ---- 5. Persist the entry to Firestore (Logging Flow) -----------------
+    if (parsedData.intent === "advisory") {
+      try {
+        const advice = await generateBusinessAdvisory(chatId, userData);
+        await safeSendTelegramMessage(chatId, advice);
+      } catch (adviceErr) {
+        console.error("[telegram] Advisory generation failed:", adviceErr);
+        await safeSendTelegramMessage(
+          chatId,
+          "⚠️ I couldn't analyze your business right now. Try logging some sales first!"
+        );
+      }
+      return NextResponse.json({ ok: true }, { status: 200 });
+    }
+
+    // ---- 5. Persist the entry & Update Inventory (Logging Flow) -----------
     try {
+      // 5a. Write the ledger entry
       await adminDb.collection("transactions").add({
         chatId,
-        businessName: userData.businessName, // link to user profile
+        businessName: userData.businessName,
         rawTranscript: transcript,
         inputSource,
         parsedLedgerData: parsedData,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
+
+      // 5b. Process inventory updates if any
+      if (parsedData.inventory_updates && parsedData.inventory_updates.length > 0) {
+        await updateInventory(chatId, parsedData.inventory_updates);
+      }
     } catch (dbErr) {
       console.error("[telegram] Firestore write failed:", dbErr);
       await safeSendTelegramMessage(
@@ -257,7 +325,21 @@ export async function POST(request) {
 
     // ---- 6. Compose and send the human-readable receipt --------------------
     const receipt = formatReceipt(parsedData, transcript);
-    await safeSendTelegramMessage(chatId, receipt);
+    
+    // Add interactive buttons if meaningful
+    let reply_markup = null;
+    if (parsedData.has_debtor || parsedData.type === "income") {
+      const buttons = [];
+      if (parsedData.has_debtor) {
+        buttons.push([{ text: "🔔 Set Reminder", callback_data: "REMIND_DEBT" }]);
+      }
+      if (parsedData.type === "income") {
+        buttons.push([{ text: "📄 Generate Receipt", callback_data: "GENERATE_RECEIPT" }]);
+      }
+      reply_markup = { inline_keyboard: buttons };
+    }
+
+    await safeSendTelegramMessage(chatId, receipt, reply_markup);
 
     return NextResponse.json({ ok: true }, { status: 200 });
   } catch (fatalErr) {
@@ -365,7 +447,57 @@ async function extractLedgerEntry(transcript) {
     parsed = { intent: "logging", transaction_detected: false, type: "none" };
   }
 
-  // Normalize the shape
+  return normalizeParsedData(parsed, transcript);
+}
+
+/**
+ * PHASE 6: Downloads a Telegram photo and extract ledger data using Groq Vision.
+ */
+async function extractFromImage(fileId) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  
+  // Step 1: resolve file metadata -> file_path.
+  const metaUrl = `${TELEGRAM_API_BASE}/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`;
+  const metaResp = await fetch(metaUrl);
+  const metaJson = await metaResp.json();
+  const filePath = metaJson?.result?.file_path;
+  const fileUrl = `${TELEGRAM_API_BASE}/file/bot${token}/${filePath}`;
+
+  // Step 2: Download image and convert to base64 for Groq
+  const fileResp = await fetch(fileUrl);
+  const arrayBuffer = await fileResp.arrayBuffer();
+  const base64Image = Buffer.from(arrayBuffer).toString("base64");
+
+  // Step 3: Call Groq Llama-3.2-Vision model
+  const completion = await groq.chat.completions.create({
+    model: "llama-3.2-11b-vision-preview",
+    response_format: { type: "json_object" },
+    messages: [
+      { 
+        role: "system", 
+        content: `${BOOKKEEPING_SYSTEM_PROMPT}\nYou are specifically reading a receipt image. Extract all line items and the total.` 
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Extract the data from this receipt into the specified JSON format." },
+          {
+            type: "image_url",
+            image_url: { url: `data:image/jpeg;base64,${base64Image}` },
+          },
+        ],
+      },
+    ],
+  });
+
+  const rawContent = completion?.choices?.[0]?.message?.content ?? "{}";
+  return normalizeParsedData(JSON.parse(rawContent));
+}
+
+/**
+ * Normalizes the extracted ledger object.
+ */
+function normalizeParsedData(parsed, transcript = "") {
   return {
     intent: parsed.intent === "reporting" ? "reporting" : "logging",
     transaction_detected: Boolean(parsed.transaction_detected),
@@ -389,6 +521,13 @@ async function extractLedgerEntry(transcript) {
           : null,
       due_date: parsed?.debtor_details?.due_date ?? null,
     },
+    inventory_updates: Array.isArray(parsed.inventory_updates)
+      ? parsed.inventory_updates.map(u => ({
+          item_name: typeof u.item_name === "string" ? u.item_name : "unknown",
+          quantity: typeof u.quantity === "number" ? u.quantity : 1,
+          action: ["increase", "decrease"].includes(u.action) ? u.action : "decrease"
+        }))
+      : [],
     report_params: {
       timeframe: ["today", "yesterday", "week", "month", "all"].includes(
         parsed?.report_params?.timeframe
@@ -401,6 +540,7 @@ async function extractLedgerEntry(transcript) {
 }
 
 /**
+ * Sends the transcript to Llama-3-70B with strict JSON-mode output and
  * Queries Firestore and generates a summary report for the user.
  */
 async function generateFinancialReport(chatId, params) {
@@ -465,6 +605,99 @@ async function generateFinancialReport(chatId, params) {
 }
 
 /**
+ * PHASE 4: Generates a business advisory pulse check using Llama-3.
+ * Fetches recent history and analyzes trends.
+ */
+async function generateBusinessAdvisory(chatId, userData) {
+  // 1. Fetch last 15 transactions
+  const snapshot = await adminDb
+    .collection("transactions")
+    .where("chatId", "==", chatId)
+    .orderBy("createdAt", "desc")
+    .limit(15)
+    .get();
+
+  if (snapshot.empty) {
+    return "💡 *Kudi Hint:* I need more data to give you advice. Start by logging a few sales or expenses!";
+  }
+
+  const history = snapshot.docs.map(doc => doc.data().parsedLedgerData);
+  
+  // 2. Call Llama to analyze and provide a quick tip
+  const completion = await groq.chat.completions.create({
+    model: LLAMA_MODEL,
+    messages: [
+      { 
+        role: "system", 
+        content: `You are Kudi, a business advisor. Analyze this history for "${userData.businessName}" (${userData.category}) and give a 2-sentence piece of advice in friendly Nigerian Pidgin/English. Be encouraging but practical.` 
+      },
+      { role: "user", content: JSON.stringify(history) },
+    ],
+  });
+
+  const advice = completion?.choices?.[0]?.message?.content ?? "Keep grinding! Your business go grow.";
+  
+  return `💡 *Kudi Business Pulse Check*\n\n${advice.trim()}\n\n_Analysis based on your last ${snapshot.size} records._`;
+}
+
+/**
+ * PHASE 2: Updates inventory levels in Firestore.
+ * Uses a transaction to ensure atomic updates and checks for low stock.
+ */
+async function updateInventory(chatId, updates) {
+  try {
+    await adminDb.runTransaction(async (transaction) => {
+      for (const update of updates) {
+        const itemRef = adminDb
+          .collection("users")
+          .doc(chatId)
+          .collection("inventory")
+          .doc(update.item_name.toLowerCase().trim());
+
+        const itemDoc = await transaction.get(itemRef);
+        let newQuantity = update.quantity;
+
+        if (itemDoc.exists) {
+          const currentQuantity = itemDoc.data().quantity || 0;
+          if (update.action === "increase") {
+            newQuantity = currentQuantity + update.quantity;
+          } else {
+            newQuantity = Math.max(0, currentQuantity - update.quantity);
+          }
+          transaction.update(itemRef, {
+            quantity: newQuantity,
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } else {
+          // If item doesn't exist, initialize it (defaulting to decrease = starting at 0 and going negative or just 0)
+          // For sales (decrease), we assume they are selling from stock they haven't logged yet.
+          if (update.action === "decrease") {
+            newQuantity = 0; // Simplified: don't go negative for new items
+          }
+          transaction.set(itemRef, {
+            name: update.item_name,
+            quantity: newQuantity,
+            threshold: 5, // Default low-stock threshold
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+
+        // Low stock alert check (threshold is 5)
+        if (newQuantity <= 5 && update.action === "decrease") {
+          await safeSendTelegramMessage(
+            chatId,
+            `⚠️ *Low Stock Alert:* You only have *${newQuantity}* left of *${escapeMarkdown(update.item_name)}*.`
+          );
+        }
+      }
+    });
+    console.log(`[inventory] Successfully updated stock for ${chatId}`);
+  } catch (err) {
+    console.error("[inventory] Transaction failed:", err);
+  }
+}
+
+/**
  * Builds the markdown receipt that gets sent back to the user.
  * Uses Telegram's "Markdown" parse mode (note: NOT MarkdownV2), so the
  * supported syntax is *bold*, _italic_, `code`, and [links](url).
@@ -500,6 +733,16 @@ function formatReceipt(entry, transcript) {
     `*Details:* ${escapeMarkdown(entry.description)}`,
   ];
 
+  // Inventory block
+  if (entry.inventory_updates && entry.inventory_updates.length > 0) {
+    lines.push("");
+    lines.push("📦 *Inventory Updated*");
+    entry.inventory_updates.forEach((u) => {
+      const emoji = u.action === "increase" ? "➕" : "➖";
+      lines.push(`${emoji} *${escapeMarkdown(u.item_name)}*: ${u.quantity}`);
+    });
+  }
+
   // Outstanding debt block — only included when meaningful.
   if (entry.has_debtor) {
     const d = entry.debtor_details || {};
@@ -525,7 +768,7 @@ function formatReceipt(entry, transcript) {
  * Wrapped to swallow errors so a failed reply never bubbles back to the
  * webhook caller.
  */
-async function safeSendTelegramMessage(chatId, text) {
+async function safeSendTelegramMessage(chatId, text, reply_markup = null) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) {
     console.error("[telegram] Cannot send message: TELEGRAM_BOT_TOKEN missing.");
@@ -533,15 +776,21 @@ async function safeSendTelegramMessage(chatId, text) {
   }
 
   try {
+    const payload = {
+      chat_id: chatId,
+      text,
+      parse_mode: "Markdown",
+      disable_web_page_preview: true,
+    };
+
+    if (reply_markup) {
+      payload.reply_markup = reply_markup;
+    }
+
     const resp = await fetch(`${TELEGRAM_API_BASE}/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        parse_mode: "Markdown",
-        disable_web_page_preview: true,
-      }),
+      body: JSON.stringify(payload),
     });
 
     if (!resp.ok) {
